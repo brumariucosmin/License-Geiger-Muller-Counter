@@ -1,0 +1,246 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SoftwareSerial.h>
+
+// Definirea pinului de resetare pentru OLED
+#define RESET_OLED 4
+Adafruit_SSD1306 afisaj(128, 32, &Wire, RESET_OLED);
+
+// Definire pentru activarea/dezactivarea debugării
+#define DEBUGARE 0
+
+// Definirea pinurilor pentru senzor, buzzer și baterie
+#define PIN_SENSOR 2
+#define PIN_BUZZER 7
+#define PIN_BATERIE A3
+
+// Definirea numărului de secunde pentru măsurare
+#define SECUNDE_MASURARE 40
+
+// Variabile volatile pentru a gestiona întreruperile
+volatile unsigned int noiImpulsuri = 0;
+volatile unsigned long ultimaOraImpuls = 0;
+volatile unsigned long ultimaOraImpulsControl = 0; // Variabilă pentru controlul frecvenței impulsurilor
+
+// Jurnale pentru impulsuri și numărătoare de impulsuri
+unsigned int jurnalImpulsuri[SECUNDE_MASURARE];
+unsigned int jurnalNumarareImpulsuri[SECUNDE_MASURARE];
+int indexJurnal = -1;
+unsigned int numarareImpulsuri = 0;
+unsigned int impulsuriPeSecunda = 0;
+unsigned long sumaJurnalNumarareImpulsuri = 0;
+
+// Timpul ultimei actualizări a jurnalelor și citirii tensiunii
+unsigned long ultimaActualizareJurnalImpulsuri = 0;
+unsigned long ultimaCitireTensiune = 0;
+
+// Variabilă pentru tensiunea bateriei
+float tensiune = 0;
+
+// Factorul de conversie din CPM în µSv/h
+#define FACTOR_CONVERSIE 0.00812
+
+// Definire pinuri pentru SoftwareSerial
+#define RX_PIN 10
+#define TX_PIN 11
+SoftwareSerial bluetoothSerial(RX_PIN, TX_PIN); // RX, TX
+
+// Variabilă pentru contorizarea impulsurilor pentru buzzer
+unsigned int contorImpulsuriBuzzer = 0;
+unsigned int pragActivareBuzzer = random(50, 71); // Setăm un prag aleator între 50 și 70
+
+// Funcția de configurare inițială
+void setup() {
+  Serial.begin(9600); // Inițializare comunicare serială pentru debugging
+  bluetoothSerial.begin(9600); // Inițializare comunicare serială pentru Bluetooth
+  delay(1000); // Întârziere adăugată din cauza rezistențelor plasate greșit
+  
+  if (!afisaj.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Inițializare afișaj OLED
+    Serial.println(F("Eroare alocare SSD1306"));
+    return;
+  }
+  
+  afisaj.display(); // Afișează conținutul pe ecran
+  afisaj.clearDisplay(); // Curăță ecranul
+  
+  // Configurarea pinurilor senzorului și buzzerului
+  pinMode(PIN_SENSOR, INPUT_PULLUP); // Configurează PIN_SENSOR cu rezistor intern pull-up
+  pinMode(PIN_BUZZER, OUTPUT); // Configurează PIN_BUZZER ca ieșire
+  
+  // Atașează întreruperea la pinul senzorului
+  attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), intrerupereSensor, FALLING);
+  
+  #if DEBUGARE
+  Serial.println("Configurare completă");
+  #endif
+}
+
+// Funcția de întrerupere pentru senzor
+void intrerupereSensor() {
+  unsigned long oraCurentaImpuls = micros();
+  if (oraCurentaImpuls - ultimaOraImpuls > 1500) { // Debounce de 1.5 ms
+    // Controlul frecvenței impulsurilor pentru a avea aproximativ 1 impuls pe secundă
+    if (oraCurentaImpuls - ultimaOraImpulsControl > 1000000L / 55) { // 1 secundă / 55 impulsuri
+      noiImpulsuri++;
+      ultimaOraImpuls = oraCurentaImpuls;
+      ultimaOraImpulsControl = oraCurentaImpuls;
+    }
+  }
+}
+
+// Funcția principală de buclă
+void loop() {
+  unsigned int _noiImpulsuri = noiImpulsuri;
+  noiImpulsuri = 0;
+  
+  actualizareImpulsuri(_noiImpulsuri);
+  actualizareJurnalImpulsuri();
+  citireTensiune();
+  
+  boolean areNoiImpulsuri = (_noiImpulsuri > 0);
+  actualizareAfisaj(areNoiImpulsuri);
+  activareBuzzer(areNoiImpulsuri);
+  
+  // Transmite datele prin Bluetooth
+  transmitereDateBluetooth();
+}
+
+// Funcția pentru citirea tensiunii bateriei
+void citireTensiune() {
+  if (!esteTimpul(ultimaCitireTensiune, 1000)) {
+    return;
+  }
+  
+  tensiune = (analogRead(PIN_BATERIE) * 5.0) / 1024.0;
+  if (tensiune < 0.1) {
+    tensiune = 0.0;
+  }
+}
+
+// Funcția pentru actualizarea numărului de impulsuri
+void actualizareImpulsuri(unsigned int valoareNoua) {
+  impulsuriPeSecunda += valoareNoua;
+  numarareImpulsuri += valoareNoua;
+  
+  #if DEBUGARE
+  if (valoareNoua > 0) {
+    Serial.print(millis());
+    Serial.print(" ");
+    Serial.print(valoareNoua);
+    Serial.print(" ");
+    Serial.println(numarareImpulsuri);
+  }
+  #endif
+}
+
+// Funcția pentru actualizarea jurnalului de impulsuri
+void actualizareJurnalImpulsuri() {
+  if (!esteTimpul(ultimaActualizareJurnalImpulsuri, 1000)) {
+    return;
+  }
+  
+  if (indexJurnal < (SECUNDE_MASURARE - 1)) {
+    indexJurnal++;
+  } else {
+    numarareImpulsuri -= jurnalImpulsuri[0];
+    sumaJurnalNumarareImpulsuri -= jurnalNumarareImpulsuri[0];
+    for (byte i = 1; i <= indexJurnal; i++) {
+      jurnalImpulsuri[i - 1] = jurnalImpulsuri[i];
+      jurnalNumarareImpulsuri[i - 1] = jurnalNumarareImpulsuri[i];
+    }
+  }
+  
+  jurnalImpulsuri[indexJurnal] = impulsuriPeSecunda;
+  impulsuriPeSecunda = 0;
+  jurnalNumarareImpulsuri[indexJurnal] = numarareImpulsuri;
+  sumaJurnalNumarareImpulsuri += numarareImpulsuri;
+  afiseazaMedieSerial();
+}
+
+// Funcția pentru actualizarea afișajului
+void actualizareAfisaj(boolean areNoiImpulsuri) {
+  afisaj.clearDisplay();
+  deseneazaValoriMasurate();
+  deseneazaNivelBaterie();
+  afisaj.display();
+}
+
+// Funcția pentru desenarea valorilor măsurate pe afișaj
+void deseneazaValoriMasurate() {
+  afisaj.setTextColor(WHITE);
+  afisaj.setCursor(0, 0);
+  afisaj.setTextSize(1);
+  afisaj.println("Impulsuri:");
+  afisaj.setTextSize(1);
+  afisaj.setCursor(60, 0);
+  afisaj.print(numarareImpulsuri);
+  
+  if (indexJurnal >= 0) {
+    afisaj.setCursor(0, 16);
+    afisaj.setTextSize(1);
+    float medieImpulsuri = sumaJurnalNumarareImpulsuri / (indexJurnal + 1);
+    float valoareUSvH = medieImpulsuri * FACTOR_CONVERSIE;
+    afisaj.print(valoareUSvH, 3); // afișează valoarea calculată în µSv/h cu 3 zecimale
+    afisaj.println(" uSv/h");
+  }
+}
+
+// Funcția pentru desenarea nivelului bateriei pe afișaj
+void deseneazaNivelBaterie() {
+  if (tensiune > 3.3) {
+    if (tensiune > 3.4) {
+      if (tensiune > 3.5) {
+        if (tensiune > 3.6) {
+          if (tensiune > 3.8) {
+          }
+        }
+      }
+    }
+  }
+}
+
+// Funcția pentru activarea buzzerului
+void activareBuzzer(boolean areNoiImpulsuri) {
+  if (areNoiImpulsuri) {
+    contorImpulsuriBuzzer += noiImpulsuri;
+    if (contorImpulsuriBuzzer >= pragActivareBuzzer) {
+      digitalWrite(PIN_BUZZER, HIGH); // buzzer PORNIT
+      delay(100); // Scurtă întârziere pentru sunet
+      digitalWrite(PIN_BUZZER, LOW); // buzzer OPRIT
+      contorImpulsuriBuzzer = 0; // Resetează contorul
+      pragActivareBuzzer = random(50, 71); // Setează un nou prag aleator între 50 și 70
+    }
+  }
+}
+
+// Funcția pentru verificarea timpului scurs
+boolean esteTimpul(unsigned long& ultimaOra, unsigned long durata) {
+  unsigned long oraCurenta = millis();
+  if ((oraCurenta - ultimaOra) < durata) {
+    return false;
+  }
+  ultimaOra = oraCurenta;
+  return true;
+}
+
+// Funcția pentru afișarea mediei impulsurilor pe serială
+void afiseazaMedieSerial() {
+  if (indexJurnal >= 0) {
+    unsigned int medieImpulsuri = sumaJurnalNumarareImpulsuri / (indexJurnal + 1);
+    Serial.print("Număr mediu impulsuri: ");
+    Serial.println(medieImpulsuri);
+  }
+}
+
+// Funcția pentru transmiterea datelor prin Bluetooth
+void transmitereDateBluetooth() {
+  bluetoothSerial.print("Impulsuri: ");
+  bluetoothSerial.println(numarareImpulsuri);
+  if (indexJurnal >= 0) {
+    float medieImpulsuri = sumaJurnalNumarareImpulsuri / (indexJurnal + 1);
+    float valoareUSvH = medieImpulsuri * FACTOR_CONVERSIE;
+    bluetoothSerial.print("uSv/h: ");
+    bluetoothSerial.println(valoareUSvH, 3);
+  }
+}
